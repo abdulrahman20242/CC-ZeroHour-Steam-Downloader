@@ -688,3 +688,11 @@ class DepotDownloaderGUI:
         return None
 
 
+def main():
+    root = ctk.CTk() if ctk else tk.Tk()
+    DepotDownloaderGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
