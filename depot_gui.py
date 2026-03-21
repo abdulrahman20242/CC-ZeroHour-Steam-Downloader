@@ -1,19 +1,26 @@
-from tkinter import ttk
 import os
 import sys
+import re
 import json
 import threading
 import queue
 import subprocess
 import time
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import ttk, messagebox
 
 try:
     import customtkinter as ctk
 except ImportError:
     ctk = None
-    # Fallback to normal tkinter only UI
+
+_IS_WIN = sys.platform == "win32"
+_IS_MAC = sys.platform == "darwin"
+
+try:
+    _POPEN_FLAGS = subprocess.CREATE_NO_WINDOW if _IS_WIN else 0
+except AttributeError:
+    _POPEN_FLAGS = 0
 
 
 class DepotDownloaderGUI:
@@ -23,23 +30,94 @@ class DepotDownloaderGUI:
         self.config_path = os.path.join(self.base_dir, "games_config.json")
         self.config = {}
         self.games = []
+        self.game_buttons = []               # ← عشان نعمل disable/enable
         self.current_thread = None
+        self.current_process = None
         self.log_queue = queue.Queue()
         self.stop_flag = threading.Event()
+
+        self._pending_status = None
+        self._pending_progress = None
 
         if ctk:
             ctk.set_appearance_mode("dark")
             ctk.set_default_color_theme("dark-blue")
-            root.title("DepotDownloader Mod GUI")
-            root.geometry("900x600")
-        else:
-            root.title("DepotDownloader Mod GUI")
-            root.geometry("900x600")
+
+        root.title("DepotDownloader Mod GUI")
+        root.geometry("1000x650")
+        root.minsize(800, 500)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.build_ui()
         self.load_config()
-        self.root.after(100, self.process_log_queue)
+        self.root.after(100, self._poll_updates)
 
+    # ──────────────────────────────────────────────
+    #  Safe Close
+    # ──────────────────────────────────────────────
+    def _on_close(self):
+        if self.current_thread and self.current_thread.is_alive():
+            if not messagebox.askyesno(
+                "تأكيد", "فيه تحميل شغال، متأكد تقفل؟"
+            ):
+                return
+            self.stop_flag.set()
+            self._kill_process(self.current_process)
+        self.root.destroy()
+
+    # ──────────────────────────────────────────────
+    #  Thread-Safe GUI Updates
+    # ──────────────────────────────────────────────
+    def set_status(self, text):
+        self._pending_status = text
+
+    def set_progress(self, value):
+        self._pending_progress = max(0.0, min(1.0, value))
+
+    def _apply_pending_updates(self):
+        if self._pending_status is not None:
+            txt = self._pending_status
+            self._pending_status = None
+            if ctk:
+                self.status_label.configure(text=txt)
+            else:
+                self.status_label.config(text=txt)
+
+        if self._pending_progress is not None:
+            val = self._pending_progress
+            self._pending_progress = None
+            if ctk:
+                self.progress.set(val)
+            else:
+                self.progress_var.set(val * 100)
+
+    # ──────────────────────────────────────────────
+    #  Cross-platform Mouse Wheel
+    # ──────────────────────────────────────────────
+    @staticmethod
+    def _bind_mousewheel(widget, callback):
+        """بتربط الـ scroll بالـ widget المحدد بس"""
+        if _IS_WIN or _IS_MAC:
+            widget.bind("<MouseWheel>", callback)
+        else:
+            # Linux
+            widget.bind("<Button-4>", callback)
+            widget.bind("<Button-5>", callback)
+
+    @staticmethod
+    def _get_scroll_delta(event):
+        """بترجع عدد الوحدات للـ scroll (cross-platform)"""
+        if _IS_WIN:
+            return -1 * (event.delta // 120)
+        elif _IS_MAC:
+            return -1 * event.delta
+        else:
+            # Linux: Button-4 = up, Button-5 = down
+            return -1 if event.num == 4 else 1
+
+    # ──────────────────────────────────────────────
+    #  Build UI
+    # ──────────────────────────────────────────────
     def build_ui(self):
         if ctk:
             self.main_frame = ctk.CTkFrame(self.root)
@@ -47,19 +125,60 @@ class DepotDownloaderGUI:
             self.main_frame = tk.Frame(self.root)
         self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Left: games grid
+        # ─── Left: Games (scrollable) ───
         if ctk:
-            self.games_frame = ctk.CTkFrame(self.main_frame)
+            self.games_frame = ctk.CTkScrollableFrame(
+                self.main_frame, width=350
+            )
+            self.games_frame.pack(
+                side="left", fill="both", expand=True, padx=(0, 5)
+            )
         else:
-            self.games_frame = tk.LabelFrame(self.main_frame, text="Games")
-        self.games_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+            games_outer = tk.LabelFrame(
+                self.main_frame, text="Games",
+                font=("Arial", 11, "bold"),
+            )
+            games_outer.pack(
+                side="left", fill="both", expand=True, padx=(0, 5)
+            )
 
-        # Right: log + progress
+            self._games_canvas = tk.Canvas(
+                games_outer, highlightthickness=0
+            )
+            games_sb = tk.Scrollbar(
+                games_outer, orient="vertical",
+                command=self._games_canvas.yview,
+            )
+            self.games_frame = tk.Frame(self._games_canvas)
+
+            self.games_frame.bind(
+                "<Configure>",
+                lambda e: self._games_canvas.configure(
+                    scrollregion=self._games_canvas.bbox("all")
+                ),
+            )
+            self._games_canvas.create_window(
+                (0, 0), window=self.games_frame, anchor="nw"
+            )
+            self._games_canvas.configure(yscrollcommand=games_sb.set)
+            self._games_canvas.pack(side="left", fill="both", expand=True)
+            games_sb.pack(side="right", fill="y")
+
+            # ─── Mouse wheel للـ games canvas بس ───
+            def _scroll_games(event):
+                delta = self._get_scroll_delta(event)
+                self._games_canvas.yview_scroll(delta, "units")
+
+            # bind على الـ canvas والـ frame جواه بس
+            self._bind_mousewheel(self._games_canvas, _scroll_games)
+            self._bind_mousewheel(self.games_frame, _scroll_games)
+
+        # ─── Right: Log + Progress ───
         if ctk:
-            self.side_frame = ctk.CTkFrame(self.main_frame)
+            self.side_frame = ctk.CTkFrame(self.main_frame, width=450)
         else:
-            self.side_frame = tk.Frame(self.main_frame)
-        self.side_frame.pack(side="right", fill="both", expand=False)
+            self.side_frame = tk.Frame(self.main_frame, width=450)
+        self.side_frame.pack(side="right", fill="both", expand=True)
 
         # Progress bar
         if ctk:
@@ -72,23 +191,45 @@ class DepotDownloaderGUI:
                 orient="horizontal",
                 mode="determinate",
                 variable=self.progress_var,
-                maximum=100
+                maximum=100,
             )
         self.progress.pack(fill="x", padx=5, pady=(10, 5))
 
         # Status label
         if ctk:
-            self.status_label = ctk.CTkLabel(self.side_frame, text="Idle")
+            self.status_label = ctk.CTkLabel(
+                self.side_frame, text="⏳ Idle"
+            )
         else:
-            self.status_label = tk.Label(self.side_frame, text="Idle")
+            self.status_label = tk.Label(
+                self.side_frame, text="⏳ Idle",
+                anchor="w", font=("Consolas", 10),
+            )
         self.status_label.pack(fill="x", padx=5)
 
         # Log text
         if ctk:
-            self.log_text = ctk.CTkTextbox(self.side_frame, height=25, width=40)
+            self.log_text = ctk.CTkTextbox(
+                self.side_frame, height=25, width=50
+            )
+            self.log_text.pack(
+                fill="both", expand=True, padx=5, pady=5
+            )
         else:
-            self.log_text = tk.Text(self.side_frame, height=25, width=50)
-        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+            log_container = tk.Frame(self.side_frame)
+            log_container.pack(
+                fill="both", expand=True, padx=5, pady=5
+            )
+            log_sb = tk.Scrollbar(log_container)
+            log_sb.pack(side="right", fill="y")
+            self.log_text = tk.Text(
+                log_container, height=25, width=50,
+                yscrollcommand=log_sb.set,
+                bg="#1e1e1e", fg="#d4d4d4",
+                font=("Consolas", 9), wrap="word",
+            )
+            self.log_text.pack(side="left", fill="both", expand=True)
+            log_sb.config(command=self.log_text.yview)
 
         # Bottom buttons
         if ctk:
@@ -97,91 +238,120 @@ class DepotDownloaderGUI:
             self.bottom_frame = tk.Frame(self.side_frame)
         self.bottom_frame.pack(fill="x", padx=5, pady=(0, 5))
 
-        if ctk:
-            self.reload_button = ctk.CTkButton(
-                self.bottom_frame, text="Reload Config", command=self.reload_config
-            )
-        else:
-            self.reload_button = tk.Button(
-                self.bottom_frame, text="Reload Config", command=self.reload_config
-            )
-        self.reload_button.pack(side="left", padx=(0, 5))
+        btn_defs = [
+            ("🔄 Reload", self.reload_config, None),
+            ("⛔ Stop", self.stop_download, "#cc3333"),
+            ("🧹 Clear", self.clear_log, None),
+        ]
+        for text, cmd, color in btn_defs:
+            if ctk:
+                kw = {"fg_color": color} if color else {}
+                b = ctk.CTkButton(
+                    self.bottom_frame, text=text,
+                    command=cmd, width=90, **kw
+                )
+            else:
+                kw = {"bg": color, "fg": "white"} if color else {}
+                b = tk.Button(
+                    self.bottom_frame, text=text, command=cmd, **kw
+                )
+            b.pack(side="left", padx=(0, 5))
 
-        if ctk:
-            self.stop_button = ctk.CTkButton(
-                self.bottom_frame, text="Stop", command=self.stop_download
-            )
-        else:
-            self.stop_button = tk.Button(
-                self.bottom_frame, text="Stop", command=self.stop_download
-            )
-        self.stop_button.pack(side="left")
+    # ──────────────────────────────────────────────
+    #  Enable/Disable Game Buttons
+    # ──────────────────────────────────────────────
+    def _set_buttons_state(self, enabled):
+        """بتعمل enable أو disable لأزرار الألعاب"""
+        for btn in self.game_buttons:
+            try:
+                if ctk:
+                    if enabled:
+                        btn.configure(state="normal")
+                    else:
+                        btn.configure(state="disabled")
+                else:
+                    btn.config(state="normal" if enabled else "disabled")
+            except tk.TclError:
+                pass  # الزر ممكن يكون اتمسح
 
+    # ──────────────────────────────────────────────
+    #  Config
+    # ──────────────────────────────────────────────
     def load_config(self):
         self.games = []
-        for widget in self.games_frame.winfo_children():
-            widget.destroy()
+        self.game_buttons = []
+
+        for w in self.games_frame.winfo_children():
+            w.destroy()
 
         if not os.path.exists(self.config_path):
-            self.log("Config file not found: games_config.json")
-            self.log("Creating a template config for you...")
+            self.log("Config not found → creating template...")
             self.create_default_config()
+
         try:
             with open(self.config_path, "r", encoding="utf-8") as f:
                 self.config = json.load(f)
+        except json.JSONDecodeError as e:
+            messagebox.showerror(
+                "JSON Error",
+                f"سطر {e.lineno}، عمود {e.colno}:\n{e.msg}",
+            )
+            return
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load config:\n{e}")
             return
 
         self.games = self.config.get("games", [])
         if not self.games:
-            self.log("No games defined in config.")
+            self.log("⚠ No games in config.")
             return
 
-        # Build game buttons grid
         cols = 2
-        row = 0
-        col = 0
         for idx, game in enumerate(self.games):
-            name = game.get("name", f"Game {idx+1}")
+            row, col = divmod(idx, cols)
+            name = game.get("name", f"Game {idx + 1}")
+            n_depots = len(game.get("depots", []))
+            label = f"{name}\n({n_depots} depots)"
+
             if ctk:
                 btn = ctk.CTkButton(
-                    self.games_frame,
-                    text=name,
+                    self.games_frame, text=label,
                     command=lambda g=game: self.start_download_for_game(g),
-                    height=80,
-                    width=200
+                    height=80, width=200,
                 )
             else:
                 btn = tk.Button(
-                    self.games_frame,
-                    text=name,
+                    self.games_frame, text=label,
                     command=lambda g=game: self.start_download_for_game(g),
-                    width=25,
-                    height=4,
-                    wraplength=150,
-                    justify="center"
+                    width=25, height=4, wraplength=180,
+                    justify="center", bg="#2d5aa0", fg="white",
+                    activebackground="#3d6ab0",
+                    font=("Arial", 10, "bold"),
                 )
+
+                # ─── لو الماوس فوق الزر يلف الـ canvas ───
+                if not ctk and hasattr(self, '_games_canvas'):
+                    def _scroll_btn(event, canvas=self._games_canvas):
+                        delta = self._get_scroll_delta(event)
+                        canvas.yview_scroll(delta, "units")
+                    self._bind_mousewheel(btn, _scroll_btn)
+
             btn.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
             self.games_frame.grid_rowconfigure(row, weight=1)
             self.games_frame.grid_columnconfigure(col, weight=1)
-            col += 1
-            if col >= cols:
-                col = 0
-                row += 1
+            self.game_buttons.append(btn)    # ← نحفظ reference
 
-        self.log(f"Loaded {len(self.games)} game(s) from config.")
+        self.log(f"✅ Loaded {len(self.games)} game(s).")
 
     def create_default_config(self):
-        # Example config using your RE4 data
         template = {
             "depotdownloader_path": "DepotDownloaderMod.exe",
             "max_downloads": 256,
             "verify_all": True,
             "games": [
                 {
-                    "id": "re4_example",
-                    "name": "Resident Evil 4 (Example)",
+                    "id": "example",
+                    "name": "Example Game",
                     "app_id": 2050650,
                     "depotkeys_file": "2050650.key",
                     "output_dir": "",
@@ -189,45 +359,50 @@ class DepotDownloaderGUI:
                         {
                             "depot_id": 2050652,
                             "manifest_id": "6176917678100737873",
-                            "manifest_file": "2050652_6176917678100737873.manifest"
-                        },
-                        {
-                            "depot_id": 2050654,
-                            "manifest_id": "4152569296804840016",
-                            "manifest_file": "2050654_4152569296804840016.manifest"
-                        },
-                        {
-                            "depot_id": 2050655,
-                            "manifest_id": "8334430982901761350",
-                            "manifest_file": "2050655_8334430982901761350.manifest"
+                            "manifest_file": "2050652_6176917678100737873.manifest",
+                            "desc": "Base Game",
                         }
-                    ]
+                    ],
                 }
-            ]
+            ],
         }
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(template, f, indent=4)
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to create default config:\n{e}")
+            messagebox.showerror("Error", str(e))
 
     def reload_config(self):
         self.load_config()
 
+    # ──────────────────────────────────────────────
+    #  Logging
+    # ──────────────────────────────────────────────
     def log(self, text):
         self.log_queue.put(text)
 
-    def process_log_queue(self):
-        try:
-            while True:
-                line = self.log_queue.get_nowait()
-                timestamp = time.strftime("%H:%M:%S")
-                self.log_text.insert("end", f"[{timestamp}] {line}\n")
-                self.log_text.see("end")
-        except queue.Empty:
-            pass
-        self.root.after(100, self.process_log_queue)
+    def clear_log(self):
+        self.log_text.delete("1.0", "end")
 
+    def _poll_updates(self):
+        count = 0
+        while count < 200:
+            try:
+                line = self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            ts = time.strftime("%H:%M:%S")
+            self.log_text.insert("end", f"[{ts}] {line}\n")
+            count += 1
+        if count:
+            self.log_text.see("end")
+
+        self._apply_pending_updates()
+        self.root.after(100, self._poll_updates)
+
+    # ──────────────────────────────────────────────
+    #  Download Dialog
+    # ──────────────────────────────────────────────
     def start_download_for_game(self, game):
         if self.current_thread and self.current_thread.is_alive():
             messagebox.showwarning("Busy", "A download is already running.")
@@ -235,240 +410,281 @@ class DepotDownloaderGUI:
 
         depots = game.get("depots", [])
         if not depots:
-            self.log("No depots defined for this game.")
+            self.log("❌ No depots for this game.")
             return
 
         if ctk:
             dialog = ctk.CTkToplevel(self.root)
-            dialog.title(f"Select Languages/Components")
-            dialog.geometry("500x550")
+            dialog.title("Select Components")
+            dialog.geometry("520x560")
+            dialog.transient(self.root)
             dialog.attributes("-topmost", True)
+            dialog.after(200, lambda: dialog.attributes("-topmost", False))
+            dialog.focus_force()
         else:
             dialog = tk.Toplevel(self.root)
-            dialog.title(f"Select Languages/Components")
-            dialog.geometry("500x550")
+            dialog.title("Select Components")
+            dialog.geometry("520x560")
+            dialog.transient(self.root)
+            dialog.attributes("-topmost", True)
+            dialog.after(200, lambda: dialog.attributes("-topmost", False))
             dialog.grab_set()
+            dialog.focus_force()
 
+        title = f"🎮 {game.get('name', 'Game')}\nاختر الأقسام:"
         if ctk:
-            lbl = ctk.CTkLabel(dialog, text="اختر اللغات أو الأقسام التي تريد تحميلها للعبة:", font=("Arial", 16, "bold"))
-            lbl.pack(pady=10)
-            scroll_frame = ctk.CTkScrollableFrame(dialog, width=450, height=400)
-            scroll_frame.pack(pady=5, fill="both", expand=True)
+            ctk.CTkLabel(
+                dialog, text=title, font=("Arial", 15, "bold")
+            ).pack(pady=10)
+            scroll = ctk.CTkScrollableFrame(dialog, width=460, height=380)
+            scroll.pack(pady=5, fill="both", expand=True)
         else:
-            lbl = tk.Label(dialog, text="اختر اللغات أو الأقسام التي تريد تحميلها للعبة:", font=("Arial", 14, "bold"))
-            lbl.pack(pady=10)
-            scroll_frame = tk.Frame(dialog)
-            scroll_frame.pack(pady=5, fill="both", expand=True)
+            tk.Label(
+                dialog, text=title,
+                font=("Arial", 13, "bold"), justify="center",
+            ).pack(pady=10)
+            scroll = tk.Frame(dialog)
+            scroll.pack(pady=5, fill="both", expand=True)
 
         vars_dict = {}
         for d in depots:
             did = str(d.get("depot_id"))
-            label_text = f"Depot {did}"
-            if "desc" in d:
-                label_text += f" - {d['desc']}"
+            desc = d.get("desc", "")
+            label = f"Depot {did}"
+            if desc:
+                label += f" — {desc}"
 
-            # Only pre-check English and Base components, uncheck others by default to save bandwidth
-            default_chk = False
-            if "desc" in d and ("Base" in d["desc"] or "English" in d["desc"] or "DirectX" in d["desc"]):
-                default_chk = True
+            default = any(
+                kw in desc for kw in ("Base", "English", "DirectX", "Core")
+            )
+            var = tk.BooleanVar(value=default)
 
             if ctk:
-                var = ctk.BooleanVar(value=default_chk)
-                cb = ctk.CTkCheckBox(scroll_frame, text=label_text, variable=var)
-                cb.pack(anchor="w", pady=5, padx=10)
+                ctk.CTkCheckBox(
+                    scroll, text=label, variable=var
+                ).pack(anchor="w", pady=4, padx=10)
             else:
-                var = tk.BooleanVar(value=default_chk)
-                cb = tk.Checkbutton(scroll_frame, text=label_text, variable=var)
-                cb.pack(anchor="w", pady=2, padx=10)
-            
+                tk.Checkbutton(
+                    scroll, text=label, variable=var
+                ).pack(anchor="w", pady=2, padx=10)
             vars_dict[did] = var
 
+        if ctk:
+            bf = ctk.CTkFrame(dialog)
+        else:
+            bf = tk.Frame(dialog)
+        bf.pack(pady=5)
+
+        def set_all(val):
+            for v in vars_dict.values():
+                v.set(val)
+
+        for txt, val in [("✅ Select All", True), ("❎ Deselect", False)]:
+            if ctk:
+                ctk.CTkButton(
+                    bf, text=txt, width=110,
+                    command=lambda v=val: set_all(v),
+                ).pack(side="left", padx=5)
+            else:
+                tk.Button(
+                    bf, text=txt, command=lambda v=val: set_all(v)
+                ).pack(side="left", padx=5)
+
         def on_confirm():
-            chosen = [d for d in depots if vars_dict[str(d.get("depot_id"))].get()]
+            chosen = [
+                d for d in depots
+                if vars_dict[str(d.get("depot_id"))].get()
+            ]
             if not chosen:
-                if ctk:
-                    messagebox.showwarning("Warning", "No components selected.")
-                else:
-                    messagebox.showwarning("Warning", "No components selected.", parent=dialog)
+                messagebox.showwarning(
+                    "Warning", "No components selected.", parent=dialog
+                )
                 return
             dialog.destroy()
             self._begin_download(game, chosen)
 
         if ctk:
-            btn = ctk.CTkButton(dialog, text="بدء التحميل (Start Download)", command=on_confirm)
-            btn.pack(pady=10)
+            ctk.CTkButton(
+                dialog, text="⬇ بدء التحميل",
+                command=on_confirm, height=40,
+            ).pack(pady=10)
         else:
-            btn = tk.Button(dialog, text="بدء التحميل (Start Download)", command=on_confirm, bg="green", fg="white", font=("Arial", 12, "bold"))
-            btn.pack(pady=10)
+            tk.Button(
+                dialog, text="⬇ بدء التحميل (Start)",
+                command=on_confirm,
+                bg="#228B22", fg="white",
+                font=("Arial", 12, "bold"),
+            ).pack(pady=10)
 
+    # ──────────────────────────────────────────────
+    #  Download Core
+    # ──────────────────────────────────────────────
     def _begin_download(self, game, chosen_depots):
         self.stop_flag.clear()
-        self.status_label.configure(text=f"Starting: {game.get('name','Game')}")
-        if ctk:
-            self.progress.set(0)
-        else:
-            self.progress_var.set(0)
+        self.set_status(f"▶ Starting: {game.get('name', 'Game')}")
+        self.set_progress(0)
+        self._set_buttons_state(False)       # ← disable الأزرار
 
         self.current_thread = threading.Thread(
-            target=self.download_game_thread, args=(game, chosen_depots), daemon=True
+            target=self._download_worker,
+            args=(game, chosen_depots),
+            daemon=True,
         )
         self.current_thread.start()
 
     def stop_download(self):
         if self.current_thread and self.current_thread.is_alive():
-            self.log("Stopping download...")
+            self.log("⛔ Stopping...")
             self.stop_flag.set()
+            self._kill_process(self.current_process)
         else:
-            self.log("No active download to stop.")
+            self.log("No active download.")
 
-    def download_game_thread(self, game, chosen_depots):
-        exe_path = self.config.get("depotdownloader_path", "DepotDownloaderMod.exe")
-        exe_path = os.path.join(self.base_dir, exe_path)
-        if not os.path.exists(exe_path):
-            self.log(f"DepotDownloader executable not found: {exe_path}")
-            self.status_label.configure(text="Error: exe not found")
+    @staticmethod
+    def _kill_process(proc):
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+        except Exception:
+            pass
+
+    def _download_worker(self, game, chosen_depots):
+        try:
+            self._run_downloads(game, chosen_depots)
+        finally:
+            # ─── دايماً نرجع الأزرار حتى لو حصل error ───
+            self.current_process = None
+            self.root.after(0, lambda: self._set_buttons_state(True))
+
+    def _run_downloads(self, game, chosen_depots):
+        exe = os.path.join(
+            self.base_dir,
+            self.config.get("depotdownloader_path", "DepotDownloaderMod.exe"),
+        )
+        if not os.path.exists(exe):
+            self.log(f"❌ Not found: {exe}")
+            self.set_status("Error: exe missing")
             return
 
         app_id = str(game.get("app_id"))
-        depots = chosen_depots
-        keys_file = game.get("depotkeys_file")
+        keys_file = game.get("depotkeys_file", "")
         output_dir = game.get("output_dir", "")
-        max_downloads = self.config.get("max_downloads", 256)
-        verify_all = self.config.get("verify_all", True)
+        max_dl = self.config.get("max_downloads", 256)
+        verify = self.config.get("verify_all", True)
 
-        if not depots:
-            self.log("No depots defined for this game.")
-            self.status_label.configure(text="Error: no depots")
+        keys_path = (
+            os.path.join(self.base_dir, keys_file) if keys_file else None
+        )
+        if keys_path and not os.path.exists(keys_path):
+            self.log(f"❌ Keys missing: {keys_path}")
+            self.set_status("Error: keys missing")
             return
 
-        keys_file_path = os.path.join(self.base_dir, keys_file) if keys_file else None
-        if keys_file_path and not os.path.exists(keys_file_path):
-            self.log(f"Depot keys file not found: {keys_file_path}")
-            self.status_label.configure(text="Error: keys missing")
-            return
+        total = len(chosen_depots)
+        self.log(f"📦 {game.get('name')} — {total} depot(s)")
 
-        total_depots = len(depots)
-        self.log(f"Starting download for {game.get('name','Game')} ({total_depots} depot(s))")
-
-        for index, depot in enumerate(depots, start=1):
+        for idx, depot in enumerate(chosen_depots, start=1):
             if self.stop_flag.is_set():
-                self.log("Download stopped by user.")
                 break
 
             depot_id = str(depot.get("depot_id"))
             manifest_id = str(depot.get("manifest_id"))
-            manifest_file = depot.get("manifest_file")
-            manifest_path = os.path.join(self.base_dir, manifest_file) if manifest_file else None
+            mf = depot.get("manifest_file", "")
+            mf_path = os.path.join(self.base_dir, mf) if mf else None
 
-            if manifest_path and not os.path.exists(manifest_path):
-                self.log(f"Manifest file missing: {manifest_path}")
+            if mf_path and not os.path.exists(mf_path):
+                self.log(f"⚠ Manifest missing: {mf}, skip")
                 continue
 
-            self.status_label.configure(
-                text=f"Depot {index}/{total_depots}: {depot_id}"
-            )
+            desc = depot.get("desc", depot_id)
+            self.set_status(f"📥 [{idx}/{total}] {desc}")
 
-            cmd = [exe_path, "-app", app_id, "-depot", depot_id,
+            cmd = [exe, "-app", app_id, "-depot", depot_id,
                    "-manifest", manifest_id]
-
-            if manifest_path:
-                cmd += ["-manifestfile", manifest_path]
-
-            if keys_file_path:
-                cmd += ["-depotkeys", keys_file_path]
-
-            if max_downloads:
-                cmd += ["-max-downloads", str(max_downloads)]
-
-            if verify_all:
+            if mf_path:
+                cmd += ["-manifestfile", mf_path]
+            if keys_path:
+                cmd += ["-depotkeys", keys_path]
+            if max_dl:
+                cmd += ["-max-downloads", str(max_dl)]
+            if verify:
                 cmd += ["-verify-all"]
-
-            # NOTE: Many builds of DepotDownloaderMod don't support -outputdir.
-            # If yours does, set "output_dir" in config; if it gives errors, keep it "".
             if output_dir:
-                out_dir_full = os.path.join(self.base_dir, output_dir)
-                os.makedirs(out_dir_full, exist_ok=True)
-                cmd += ["-outputdir", out_dir_full]
+                out = os.path.join(self.base_dir, output_dir)
+                os.makedirs(out, exist_ok=True)
+                cmd += ["-outputdir", out]
 
-            self.log(f"Running: {' '.join(cmd)}")
+            self.log(f"🔧 {' '.join(cmd)}")
+
             try:
-                process = subprocess.Popen(
+                proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
-                    errors="replace"
+                    errors="replace",
+                    creationflags=_POPEN_FLAGS,
                 )
+                self.current_process = proc
             except Exception as e:
-                self.log(f"Failed to start process: {e}")
+                self.log(f"❌ Failed: {e}")
                 break
 
-            # Read output
-            while True:
-                if self.stop_flag.is_set():
-                    process.terminate()
-                    self.log("Process terminated.")
-                    break
-
-                line = process.stdout.readline()
-                if not line:
-                    if process.poll() is not None:
+            try:
+                for line in proc.stdout:
+                    if self.stop_flag.is_set():
+                        self._kill_process(proc)
                         break
-                    else:
-                        time.sleep(0.1)
+                    line = line.rstrip()
+                    if not line:
                         continue
-
-                line = line.rstrip()
-                if line:
                     self.log(line)
-                    # Try naive progress detection
-                    perc = self.extract_percentage(line)
+                    perc = self._extract_percentage(line)
                     if perc is not None:
-                        if ctk:
-                            self.progress.set(perc / 100.0)
-                        else:
-                            self.progress_var.set(perc)
+                        overall = ((idx - 1) + perc / 100.0) / total
+                        self.set_progress(overall)
+            except Exception as e:
+                self.log(f"⚠ Read error: {e}")
 
-            retcode = process.poll()
-            if retcode == 0:
-                self.log(f"Depot {depot_id} finished successfully.")
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._kill_process(proc)
+
+            self.current_process = None
+
+            if self.stop_flag.is_set():
+                self.log("⛔ Stopped by user.")
+                break
+
+            rc = proc.returncode
+            if rc == 0:
+                self.log(f"✅ Depot {depot_id} done.")
             else:
-                self.log(f"Depot {depot_id} exited with code {retcode}.")
+                self.log(f"⚠ Depot {depot_id} exit: {rc}")
 
-            # Update overall depot progress (in case we never saw % output)
-            frac = index / total_depots
-            if ctk:
-                self.progress.set(frac)
-            else:
-                self.progress_var.set(frac * 100)
+            self.set_progress(idx / total)
 
-        self.status_label.configure(text="Done")
-        self.log("All requested depots processed.")
+        if self.stop_flag.is_set():
+            self.set_status("⛔ Stopped")
+        else:
+            self.set_status("✅ Done")
+            self.log("🏁 All depots processed.")
 
     @staticmethod
-    def extract_percentage(line):
-        # Try to find a pattern like ' 42%' in the line
-        import re
+    def _extract_percentage(line):
         m = re.search(r'(\d{1,3})\s*%', line)
         if m:
-            try:
-                val = int(m.group(1))
-                if 0 <= val <= 100:
-                    return val
-            except ValueError:
-                return None
+            val = int(m.group(1))
+            if 0 <= val <= 100:
+                return val
         return None
 
 
-def main():
-    if ctk:
-        root = ctk.CTk()
-    else:
-        root = tk.Tk()
-    app = DepotDownloaderGUI(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
