@@ -1,0 +1,5 @@
+a033b74633550741e898734b6084e370fee260e6ed1e7b244b4bf42929649b21
+
+https://api.manifesthub1.filegear-sg.me/manifest?apikey=a033b74633550741e898734b6084e370fee260e6ed1e7b244b4bf42929649b21&depotid=<depotid>&manifestid=<manifest id>
+
+https://api.manifesthub1.filegear-sg.me/manifest?apikey=a033b74633550741e898734b6084e370fee260e6ed1e7b244b4bf42929649b21&depotid=1570011&manifestid=2743460449861281862

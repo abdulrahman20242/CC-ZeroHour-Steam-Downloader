@@ -1,0 +1,82 @@
+{
+  "depotdownloader_path": "DepotDownloaderMod.exe",
+  "max_downloads": 32,
+  "verify_all": true,
+  "games": [
+    {
+      "id": "cczero",
+      "name": "Command & Conquer Generals Zero Hour",
+      "app_id": 2732960,
+      "depotkeys_file": "2732960.key",
+      "output_dir": "",
+      "depots": [
+        {
+          "depot_id": 228990,
+          "manifest_id": "1829726630299308803",
+          "manifest_file": "228990_1829726630299308803.manifest",
+          "desc": "DirectX / Redistributables"
+        },
+        {
+          "depot_id": 2732961,
+          "manifest_id": "3344439144923484111",
+          "manifest_file": "2732961_3344439144923484111.manifest",
+          "desc": "Base Game (1.74 GiB)"
+        },
+        {
+          "depot_id": 2732962,
+          "manifest_id": "5821254281996315452",
+          "manifest_file": "2732962_5821254281996315452.manifest",
+          "desc": "English (1019.94 MiB)"
+        },
+        {
+          "depot_id": 2732963,
+          "manifest_id": "660457496074655285",
+          "manifest_file": "2732963_660457496074655285.manifest",
+          "desc": "German (1.64 GiB)"
+        },
+        {
+          "depot_id": 2732964,
+          "manifest_id": "239726342111660937",
+          "manifest_file": "2732964_239726342111660937.manifest",
+          "desc": "French (1010.31 MiB)"
+        },
+        {
+          "depot_id": 2732965,
+          "manifest_id": "7962349642982658745",
+          "manifest_file": "2732965_7962349642982658745.manifest",
+          "desc": "Traditional Chinese (1.10 GiB)"
+        },
+        {
+          "depot_id": 2732966,
+          "manifest_id": "180662003469839699",
+          "manifest_file": "2732966_180662003469839699.manifest",
+          "desc": "Korean (1.10 GiB)"
+        },
+        {
+          "depot_id": 2732967,
+          "manifest_id": "1810351349746393632",
+          "manifest_file": "2732967_1810351349746393632.manifest",
+          "desc": "Italian (1.14 GiB)"
+        },
+        {
+          "depot_id": 2732968,
+          "manifest_id": "4422136527606628926",
+          "manifest_file": "2732968_4422136527606628926.manifest",
+          "desc": "Polish (1015.35 MiB)"
+        },
+        {
+          "depot_id": 2732969,
+          "manifest_id": "7186315325109672693",
+          "manifest_file": "2732969_7186315325109672693.manifest",
+          "desc": "Portuguese - Brazil (1015.97 MiB)"
+        },
+        {
+          "depot_id": 2748391,
+          "manifest_id": "8805294086247859477",
+          "manifest_file": "2748391_8805294086247859477.manifest",
+          "desc": "Spanish - Spain (1.14 GiB)"
+        }
+      ]
+    }
+  ]
+}
